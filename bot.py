@@ -1,142 +1,105 @@
-import asyncio
-from telegram import (
-    Update,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-)
+import asyncio, textwrap
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
+    ApplicationBuilder, CommandHandler, MessageHandler,
+    ContextTypes, filters,
 )
-
 from config import BOT_TOKEN
-from database import init_db
-from story import load_stories, stories
-from state import start_or_resume_story, advance, user_stories
+from database import init_db, ensure_user
+from story import load_stories, stories, get_story, Node
+from state import start_or_resume_story, advance
 
 
-# ──────────────────────────   helpers   ──────────────────────────
-def main_menu_kb():
-    # кнопки всех доступных историй
-    rows = [[KeyboardButton(st.title)] for st in stories.values()]
-    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
-
-
-def options_kb(node):
-    # кнопки вариантов ответа
-    rows = [
-        [KeyboardButton(f"{idx+1}. {opt['text']}")]
-        for idx, opt in enumerate(node.options)
-    ]
-    # добавить кнопку «/menu»
-    rows.append([KeyboardButton("/menu")])
-    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
-
-
-async def show_main_menu(update: Update):
-    await update.message.reply_text(
-        "📚 Выбери историю:", reply_markup=main_menu_kb()
+# ─────────────── клавиатуры ───────────────
+def menu_kb():
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton(st.title)] for st in stories.values()],
+        resize_keyboard=True
     )
 
+def options_kb(node: Node):
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton(opt.text)] for opt in node.options] + [[KeyboardButton("/menu")]],
+        resize_keyboard=True
+    )
 
-async def send_node(
-    chat_id: int,
-    context: ContextTypes.DEFAULT_TYPE,
-    node,
-):
-    text = f"👤 *{node.text}*"
+# ─────────────── helpers ───────────────
+async def show_menu(update: Update):
+    await update.message.reply_text("📚 Выбери историю:", reply_markup=menu_kb())
+
+async def send_node(chat_id: int, node: Node, ctx: ContextTypes.DEFAULT_TYPE):
+    text = f"👤 *{node.text.strip()}*"
     if node.options:
         text += "\n\nВыбери действие:"
-    await context.bot.send_message(
-        chat_id, text, reply_markup=options_kb(node), parse_mode="Markdown"
-    )
+    await ctx.bot.send_message(chat_id, text, reply_markup=options_kb(node), parse_mode="Markdown")
 
+# ─────────────── handlers ───────────────
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await ensure_user(update.effective_user)
+    ctx.user_data.clear()
+    await show_menu(update)
 
-# ──────────────────────────   handlers   ──────────────────────────
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()  # очистить режим
-    await show_main_menu(update)
+async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data.clear()
+    await show_menu(update)
 
-
-async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    await show_main_menu(update)
-
-
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.message.text.strip()
     uid = update.effective_user.id
 
-    # 1) если не в игре — трактуем текст как название истории
-    if "story_id" not in context.user_data:
-        # найти историю по заголовку
+    # не в истории → выбираем историю
+    if "story_id" not in ctx.user_data:
         for st in stories.values():
             if msg == st.title:
-                context.user_data["story_id"] = st.id
-                story, node_id, inv, finished = await start_or_resume_story(
-                    uid, st.id
-                )
-                context.user_data["node_id"] = node_id
-                context.user_data["inventory"] = inv
-                await send_node(uid, context, story.get_node(node_id))
+                ctx.user_data["story_id"] = st.id
+                story, node_id, inv, fin = await start_or_resume_story(uid, st.id)
+                ctx.user_data["node_id"] = node_id
+                ctx.user_data["inv"] = inv
+                await send_node(uid, story.nodes[node_id], ctx)
                 return
-        await update.message.reply_text("Не понял. Используй меню /menu")
+        await update.message.reply_text("Не понял. Напиши /menu")
         return
 
-    # 2) в режиме игры — обрабатываем выбор
-    story_id = context.user_data["story_id"]
-    story = stories[story_id]
-    node = story.get_node(context.user_data["node_id"])
-
-    # выход в меню
+    # выход
     if msg == "/menu":
-        context.user_data.clear()
-        await show_main_menu(update)
+        ctx.user_data.clear()
+        await show_menu(update)
         return
 
-    # парсим «N. текст варианта» -> N
-    if not node.options:
-        await update.message.reply_text("История уже окончена. /menu")
+    # выбор опции
+    story_id = ctx.user_data["story_id"]
+    story = get_story(story_id)
+    node = story.nodes[ctx.user_data["node_id"]]
+
+    opt = next((o for o in node.options if o.text == msg), None)
+    if not opt:
+        await update.message.reply_text("Выбери кнопку действия или /menu")
         return
 
-    try:
-        idx = int(msg.split(".")[0]) - 1
-        opt = node.options[idx]
-    except (ValueError, IndexError):
-        await update.message.reply_text("Выбери кнопку с нужным вариантом.")
+    next_id, err = await advance(
+        uid, story_id, node.id, opt, ctx.user_data["inv"]
+    )
+    if err:
+        await update.message.reply_text(err)
         return
 
-    next_id = opt["next_id"]
-    next_node = story.get_node(next_id)
-    finished = not bool(next_node.options)
+    ctx.user_data["node_id"] = next_id
+    next_node = story.nodes[next_id]
+    await send_node(uid, next_node, ctx)
 
-    await advance(uid, story_id, next_id, context.user_data["inventory"], finished)
-    context.user_data["node_id"] = next_id
+    if not next_node.options:
+        await update.message.reply_text("🎉 История завершена! /menu — в меню.")
+        ctx.user_data.clear()
 
-    await send_node(uid, context, next_node)
-
-    if finished:
-        await update.message.reply_text(
-            "🎉 История завершена! /menu — вернуться в меню."
-        )
-        context.user_data.clear()
-
-
-# ──────────────────────────   main   ──────────────────────────
+# ─────────────── init ───────────────
 if __name__ == "__main__":
-    # отдельный цикл (Python 3.11 + PTB 20)
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_until_complete(init_db())
     load_stories()
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("menu", cmd_menu))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-
     app.run_polling()
