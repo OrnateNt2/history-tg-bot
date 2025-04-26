@@ -1,10 +1,10 @@
 import aiosqlite, sqlite3
 from datetime import datetime
-from typing import List, Optional, Tuple
+from typing import List, Optional
 from config import DATABASE_PATH
 
 
-# ─────────────── схема ───────────────
+# ────────────────────────── schema ──────────────────────────
 async def init_db() -> None:
     async with aiosqlite.connect(DATABASE_PATH) as db:
         await db.executescript(
@@ -67,7 +67,7 @@ async def init_db() -> None:
         await db.commit()
 
 
-# ─────────────── users ───────────────
+# ────────────────────────── users ──────────────────────────
 async def ensure_user(tg_user) -> None:
     async with aiosqlite.connect(DATABASE_PATH) as db:
         await db.execute(
@@ -75,9 +75,9 @@ async def ensure_user(tg_user) -> None:
             INSERT INTO users(id, username, first_name, last_name, joined_at)
             VALUES(?,?,?,?,?)
             ON CONFLICT(id) DO UPDATE SET
-                username   = excluded.username,
-                first_name = excluded.first_name,
-                last_name  = excluded.last_name
+              username   = excluded.username,
+              first_name = excluded.first_name,
+              last_name  = excluded.last_name
             """,
             (
                 tg_user.id,
@@ -90,15 +90,24 @@ async def ensure_user(tg_user) -> None:
         await db.commit()
 
 
-# ─────────────── bulk-upsert истории ───────────────
+# ────────────────────────── bulk-upsert истории ──────────────────────────
 def bulk_upsert_story(story) -> None:
+    """
+    Заносит структуры story/nodes/options в БД (idempotent).
+    Если Node.text — список, склеиваем через «\n» для хранения.
+    """
     con = sqlite3.connect(DATABASE_PATH)
     cur = con.cursor()
-    cur.execute("INSERT OR IGNORE INTO stories(id,title) VALUES(?,?)", (story.id, story.title))
+
+    cur.execute("INSERT OR IGNORE INTO stories(id,title) VALUES(?,?)",
+                (story.id, story.title))
 
     for node in story.nodes.values():
-        cur.execute("INSERT OR IGNORE INTO nodes(id,story_id,text) VALUES(?,?,?)",
-                    (node.id, story.id, node.text))
+        text_val = "\n".join(node.text) if isinstance(node.text, list) else node.text
+        cur.execute(
+            "INSERT OR IGNORE INTO nodes(id,story_id,text) VALUES(?,?,?)",
+            (node.id, story.id, text_val),
+        )
 
         for opt in node.options:
             cur.execute(
@@ -112,9 +121,9 @@ def bulk_upsert_story(story) -> None:
                 cur.execute(
                     """
                     INSERT INTO options(
-                      node_id,text,next_node_id,
-                      add_item,remove_item,required_item,
-                      chance,success_id,fail_id)
+                        node_id,text,next_node_id,
+                        add_item,remove_item,required_item,
+                        chance,success_id,fail_id)
                     VALUES(?,?,?,?,?,?,?,?,?)
                     """,
                     (
@@ -133,7 +142,7 @@ def bulk_upsert_story(story) -> None:
     con.close()
 
 
-# ─────────────── progress ───────────────
+# ────────────────────────── progress ──────────────────────────
 async def get_progress(user_id: int, story_id: str):
     async with aiosqlite.connect(DATABASE_PATH) as db:
         cur = await db.execute(
@@ -150,7 +159,7 @@ async def set_progress(
     node_id: str,
     inventory: List[str],
     finished: bool,
-) -> None:
+):
     now = datetime.utcnow().isoformat(timespec="seconds")
     inv = ",".join(inventory)
     fin = 1 if finished else 0
@@ -161,10 +170,10 @@ async def set_progress(
                                  is_finished,started_at,updated_at)
             VALUES(?,?,?,?,?,?,?)
             ON CONFLICT(user_id,story_id) DO UPDATE SET
-              node_id     = excluded.node_id,
-              inventory   = excluded.inventory,
-              is_finished = excluded.is_finished,
-              updated_at  = excluded.updated_at
+                node_id     = excluded.node_id,
+                inventory   = excluded.inventory,
+                is_finished = excluded.is_finished,
+                updated_at  = excluded.updated_at
             """,
             (user_id, story_id, node_id, inv, fin, now, now),
         )
@@ -180,7 +189,7 @@ async def list_user_stories(user_id: int):
         return await cur.fetchall()
 
 
-# ─────────────── stats ───────────────
+# ────────────────────────── stats ──────────────────────────
 async def get_option_id(node_id: str, text: str) -> Optional[int]:
     async with aiosqlite.connect(DATABASE_PATH) as db:
         cur = await db.execute(
